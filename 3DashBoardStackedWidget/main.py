@@ -13,9 +13,11 @@ from PySide6.QtWidgets import (QMainWindow, QApplication, QLineEdit,
                                QSizePolicy, QHBoxLayout)
 from PySide6.QtCore import (QStandardPaths, Qt, QFileInfo, QUrl, QRegularExpression,
                             QThreadPool, QDir)
-from PySide6.QtGui import QAction, QDesktopServices, QRegularExpressionValidator
+from PySide6.QtGui import (QAction, QDesktopServices, QRegularExpressionValidator,
+                           QShortcut, QKeySequence)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PySide6.QtWebEngineCore import (QWebEngineProfile, QWebEnginePage,
+                                     QWebEngineSettings)
 from PySide6.QtNetwork import QNetworkProxy
 
 from main_window import Ui_MainWindow
@@ -61,7 +63,7 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         self.browser.setUrl(QUrl("https://secure.ethicspoint.com/domain/administration/client_admin.asp"))
 
     def setup_browser_logic(self):
-        # 1. Network Speed Hack (Disable Proxy)
+        # 1. Network Speed Hack
         QNetworkProxy.setApplicationProxy(QNetworkProxy(QNetworkProxy.NoProxy))
 
         # 2. Storage Setup
@@ -73,13 +75,18 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         self.web_profile.setPersistentStoragePath(storage_path)
         self.web_profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
 
+        self.web_profile = QWebEngineProfile("MyProfile", self)
+
+        # --- THE FIX: Use the integer index for DeveloperExtrasEnabled ---
+        # 13 is the universal Qt index for enabling Inspect Element
+        self.web_profile.settings().setAttribute(QWebEngineSettings.WebAttribute(13), True)
+
         # 3. Create Browser & Page
         self.browser = QWebEngineView()
         self.web_page = QWebEnginePage(self.web_profile, self.browser)
         self.browser.setPage(self.web_page)
 
-        # 4. CLEAN Page 4 (The Tab in the Stacked Widget)
-        # If there's an existing layout or widgets, remove them
+        # 4. CLEAN Page 4 Layout
         if self.page_4.layout():
             while self.page_4.layout().count():
                 child = self.page_4.layout().takeAt(0)
@@ -90,13 +97,164 @@ class MyWindow(QMainWindow, Ui_MainWindow):
             layout.setContentsMargins(0, 0, 0, 0)
             self.page_4.setLayout(layout)
 
-        # 5. Add only the browser to the layout
+        # 5. Add browser to layout
         self.page_4.layout().addWidget(self.browser)
 
-        # 6. Status Bar Integration (replaces the "White Loading" text)
+        # 6. Signals
         self.browser.loadStarted.connect(lambda: self.statusBar().showMessage("Loading EthicsPoint..."))
-        self.browser.loadFinished.connect(
-            lambda ok: self.statusBar().showMessage("Ready" if ok else "Load Failed", 3000))
+
+        self.browser.urlChanged.connect(self.handle_url_change)
+
+        # Using a named function prevents duplicate logic issues
+        self.browser.loadFinished.connect(self.on_page_load_finished)
+
+    def handle_url_change(self, qurl):
+        url_str = qurl.toString().lower()
+
+        # If we just finished MFA and are on ANY 'administration' page that isn't the client page
+        if "administration" in url_str and "client_admin" not in url_str:
+            if hasattr(self, 'last_requested_cid'):
+                cid = self.last_requested_cid
+                domain = "ethicspoint.eu" if 100000 <= cid <= 1000000 else "ethicspoint.com"
+                new_target = f"https://secure.{domain}/domain/administration/client_admin.asp?clientid={cid}"
+
+                self.statusBar().showMessage("Login successful! Redirecting to CID...")
+                self.browser.setUrl(QUrl(new_target))
+
+    def on_page_load_finished(self, ok):
+        if not ok: return
+
+        # This script checks for your specific HTML markers: "ClientID=0" or "Not Found" text
+        js_check = """
+        (function() {
+            let html = document.body.innerText;
+            let cidInput = document.querySelector('input[name="ClientID"]');
+            let external = html.includes("external data center") || document.getElementsByName('external_clientid').length > 0;
+
+            if (html.includes("Could not find client in the CM Database") || (cidInput && cidInput.value === "0") || external) {
+                return "TRY_OTHER_SERVER";
+            }
+            if (cidInput && cidInput.value !== "0") {
+                return { "status": "SUCCESS", "name": document.querySelector('input[name="name"]')?.value || "Found" };
+            }
+            return "UNKNOWN";
+        })()
+        """
+        self.browser.page().runJavaScript(js_check, self.handle_region_flip)
+
+    def handle_region_flip(self, result):
+        if result == "TRY_OTHER_SERVER":
+            current_url = self.browser.url().toString()
+            # If we haven't already retried for THIS search
+            if not hasattr(self, '_is_retrying') or not self._is_retrying:
+                self._is_retrying = True
+                new_url = current_url.replace(".com", ".eu") if ".com" in current_url else current_url.replace(".eu",
+                                                                                                               ".com")
+                self.statusBar().showMessage("🔄 Not found. Swapping regions...")
+                self.browser.setUrl(QUrl(new_url))
+            else:
+                self.statusBar().showMessage("❌ Client not found on either server.")
+                self._is_retrying = False
+        elif isinstance(result, dict) and result.get("status") == "SUCCESS":
+            self._is_retrying = False
+            self.client_name_display.setText(f"Active: {result['name']}")
+
+    def handle_sniffer_result(self, result):
+        if not result: return
+        status = result.get("status")
+
+        if status in ["NOT_FOUND", "EXTERNAL_REFERRAL"]:
+            current_url = self.browser.url().toString()
+
+            # Simple toggle: If on .com go to .eu, if on .eu go to .com
+            if ".com" in current_url:
+                new_url = current_url.replace(".com", ".eu")
+            elif ".eu" in current_url:
+                new_url = current_url.replace(".eu", ".com")
+            else:
+                return
+
+            # Prevent endless bouncing: We only swap once per "Execute" click
+            if not hasattr(self, '_is_retrying') or not self._is_retrying:
+                self._is_retrying = True
+                self.statusBar().showMessage(f"Switching Region... (Found {status})")
+                self.browser.setUrl(QUrl(new_url))
+            else:
+                self.statusBar().showMessage("❌ Client not found on either server.")
+                self._is_retrying = False
+
+        elif status == "SUCCESS":
+
+            client_name = result.get("name")
+            # Update the Header Label!
+            self.client_name_display.setText(f"Active: {client_name}")
+            self.statusBar().showMessage(f"✅ Loaded: {client_name}")
+
+    def process_page_state(self, result):
+        if not result: return
+        state = result.get("state")
+
+        if state == "MFA_REQUIRED":
+            self.statusBar().showMessage("⚠️ MFA/Login Required - Please log in to continue.")
+
+        elif state in ["EXTERNAL_DATACENTER", "NOT_FOUND"]:
+            # Logic: Try the OTHER server
+            current_url = self.browser.url().toString()
+            new_url = ""
+            if ".com" in current_url:
+                new_url = current_url.replace(".com", ".eu")
+                self.statusBar().showMessage("🔄 Not found on US. Trying EU Server...")
+            else:
+                new_url = current_url.replace(".eu", ".com")
+                self.statusBar().showMessage("🔄 Not found on EU. Trying US Server...")
+
+            # Prevent infinite loops: only swap once
+            if not hasattr(self, '_retry_count'): self._retry_count = 0
+            if self._retry_count < 1:
+                self._retry_count += 1
+                self.browser.setUrl(QUrl(new_url))
+            else:
+                self.statusBar().showMessage("❌ Client not found on either server.")
+                self._retry_count = 0
+
+        elif state == "SUCCESS":
+            self._retry_count = 0  # Reset retries
+            client_name = result.get("name")
+            # Logic: Update the window title or a future label
+            self.setWindowTitle(f"EthicsPoint Manager - {client_name}")
+            self.statusBar().showMessage(f"✅ Active Client: {client_name}")
+            print(f"Verified Client: {client_name} (ID: {result.get('client_id')})")
+
+    def scrape_client_info(self):
+        # Example: Scraping the Client Name from an <h1> or a specific ID
+        # You will need to inspect the EthicsPoint HTML to find the exact selectors
+        js_code = """
+        (function() {
+            // Look for the client name in the header
+            let clientName = document.querySelector('.clientNameSelector')?.innerText || "Unknown";
+            let clientStatus = document.getElementById('statusField')?.innerText || "No Status";
+
+            return {
+                "name": clientName,
+                "status": clientStatus
+            };
+        })()
+        """
+
+        # Run the JS and handle the result
+        self.browser.page().runJavaScript(js_code, self.process_scraped_data)
+
+    def process_scraped_data(self, data):
+        if data:
+            name = data.get("name")
+            status = data.get("status")
+
+            # Display the info in your App!
+            self.setWindowTitle(f"Project Dashboard - {name}")
+            self.statusBar().showMessage(f"Client: {name} | Status: {status}")
+
+            # You could also update a label in your Explorer view
+            # self.some_label.setText(f"Active Client: {name}")
 
     def setup_tree_context_menu(self, tree, model):
         # Right-click menu
@@ -291,22 +449,29 @@ class MyWindow(QMainWindow, Ui_MainWindow):
     def setup_header_widgets(self):
         self.header.clear()
 
+        # 1. CID Input
         self.header_input = QLineEdit()
         self.header_input.setPlaceholderText("Client ID")
-        self.header_input.setMinimumWidth(150)
-        regex = QRegularExpression(r"^(cl\s?)?\d+$", QRegularExpression.CaseInsensitiveOption)
-        self.header_input.setValidator(QRegularExpressionValidator(regex, self))
+        self.header_input.setMinimumWidth(120)
+        self.header_input.setValidator(QRegularExpressionValidator(QRegularExpression(r"^(cl\s?)?\d+$"), self))
 
+        # 2. Buttons
         self.header_button = QPushButton("Execute")
 
-        # This is our toggle button
+        # --- THE FIX: Define self.view_btn clearly ---
         self.view_btn = QPushButton("Show Browser")
         self.view_btn.setCheckable(True)
 
         self.back_to_files_btn = QPushButton("📁 Explorer")
 
+        # 3. Client Name Display
+        self.client_name_display = QLabel("No Client Active")
+        self.client_name_display.setStyleSheet("font-weight: bold; color: blue; padding: 0 10px;")
+
+        # 4. Add to Toolbar
         self.header.addWidget(self.header_input)
         self.header.addWidget(self.header_button)
+        self.header.addWidget(self.client_name_display)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -315,12 +480,10 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         self.header.addWidget(self.view_btn)
         self.header.addWidget(self.back_to_files_btn)
 
-        # CONNECTIONS
+        # 5. Connections
         self.header_button.clicked.connect(self.handle_submit)
         self.header_input.returnPressed.connect(self.handle_submit)
         self.view_btn.clicked.connect(self.toggle_view)
-
-        # SYNC LOGIC: When 'Explorer' is clicked, uncheck the toggle button
         self.back_to_files_btn.clicked.connect(self.go_to_explorer)
 
     def go_to_explorer(self):
@@ -334,20 +497,20 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         cid_digits = "".join(filter(str.isdigit, raw_text))
         if not cid_digits: return
 
-        cid_num = int(cid_digits)
-        # Determine domain
-        is_eu = 100000 <= cid_num <= 1000000
-        domain = "ethicspoint.eu" if is_eu else "ethicspoint.com"
-        target_url = f"https://secure.{domain}/domain/administration/client_admin.asp?clientid={cid_num}"
-        print(target_url)
-        # Update UI
-        self.statusBar().showMessage(f"Connecting to {'EU' if is_eu else 'US'} Server...")
-        self.stackedWidget.setCurrentIndex(1)
-        self.view_btn.setChecked(True)
-        self.view_btn.setText("Show Explorer")
+        # Store for the MFA auto-jump!
+        self.last_requested_cid = int(cid_digits)
+        self._is_retrying = False
 
-        # Load the page
+        domain = "ethicspoint.eu" if 100000 <= self.last_requested_cid <= 1000000 else "ethicspoint.com"
+        target_url = f"https://secure.{domain}/domain/administration/client_admin.asp?clientid={self.last_requested_cid}"
+
         self.browser.setUrl(QUrl(target_url))
+        self.stackedWidget.setCurrentIndex(1)
+
+        # Sync the toggle button
+        if hasattr(self, 'view_btn'):
+            self.view_btn.setChecked(True)
+            self.view_btn.setText("Show Explorer")
 
     def on_server_ready(self, url):
         # Default: Show it inside the app
