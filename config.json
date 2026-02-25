@@ -1,0 +1,6 @@
+{
+  "USEPAdmin": "https://secure.ethicspoint.com/domain/administration/client_admin.asp",
+  "EUEPAdmin": "https://secure.ethicspoint.eu/domain/administration/client_admin.asp",
+  "USEPAdminClientID": "https://secure.ethicspoint.com/domain/administration/client_admin.asp?client=",
+  "EUEPAdminClientID": "https://secure.ethicspoint.eu/domain/administration/client_admin.asp?client="
+}
