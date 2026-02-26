@@ -4,6 +4,7 @@
 import sys
 import os
 import time
+import json
 
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--log-level=3 --disable-logging"
 
@@ -39,6 +40,11 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         super().__init__()
         self.setupUi(self)
 
+        # Sniffer counters used by run_sniffer()/watchdog
+        self._sniff_seq = 0
+        self._sniff_retries = 0
+        self._max_sniff_retries = 12
+
         # 1. Clean Tabs
         while self.project_directory_tabs_2.count() > 0:
             self.project_directory_tabs_2.removeTab(0)
@@ -63,44 +69,48 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         # Keep the sniffer JS accessible for retries
         self._sniffer_js = """
         (function() {
-            const text = (document.body && document.body.innerText ? document.body.innerText : "").toLowerCase();
-            const title = (document.title || "").toLowerCase();
-            const html = (document.documentElement && document.documentElement.innerHTML ? document.documentElement.innerHTML : "").toLowerCase();
+            try {
+                const text = (document.body && document.body.innerText ? document.body.innerText : "").toLowerCase();
+                const title = (document.title || "").toLowerCase();
+                const html = (document.documentElement && document.documentElement.innerHTML ? document.documentElement.innerHTML : "").toLowerCase();
 
-            const cidInput = document.querySelector('input[name="ClientID"]');
-            const nameInput = document.querySelector('input[name="name"]');
+                const cidInput = document.querySelector('input[name="ClientID"]');
+                const nameInput = document.querySelector('input[name="name"]');
 
-            // SUCCESS: standard client page
-            if (cidInput && cidInput.value !== "0" && nameInput && nameInput.value.trim().length > 0) {
-                return { status: "SUCCESS", name: nameInput.value, client_id: cidInput.value };
+                // SUCCESS: standard client page
+                if (cidInput && cidInput.value !== "0" && nameInput && nameInput.value.trim().length > 0) {
+                    return { status: "SUCCESS", name: nameInput.value, client_id: cidInput.value };
+                }
+
+                // External data center / not found messages (prefer visible text)
+                const isExternal =
+                    text.includes("referencing an external data center") ||
+                    html.includes("external data center") ||
+                    document.getElementsByName('external_clientid').length > 0;
+
+                const isNotFound =
+                    text.includes("could not find client") ||
+                    html.includes("could not find client") ||
+                    (cidInput && cidInput.value === "0");
+
+                if (isExternal) return "TRY_OTHER_SERVER";
+                if (isNotFound) return "TRY_OTHER_SERVER";
+
+                // Landing/frameset admin shell (common right after login)
+                const hasFrameset = document.getElementsByTagName('frameset').length > 0;
+                if (hasFrameset || title.includes("ethicspoint administration")) {
+                    return "MFA_OR_LANDING";
+                }
+
+                // Microsoft SSO page
+                if (title.includes("sign in")) {
+                    return "MFA_REQUIRED";
+                }
+
+                return "UNKNOWN";
+            } catch (e) {
+                return { status: "JS_ERROR", message: String(e) };
             }
-
-            // External data center / not found messages (prefer visible text)
-            const isExternal =
-                text.includes("referencing an external data center") ||
-                html.includes("external data center") ||
-                document.getElementsByName('external_clientid').length > 0;
-
-            const isNotFound =
-                text.includes("could not find client") ||
-                html.includes("could not find client") ||
-                (cidInput && cidInput.value === "0");
-
-            if (isExternal) return "TRY_OTHER_SERVER";
-            if (isNotFound) return "TRY_OTHER_SERVER";
-
-            // Landing/frameset admin shell (common right after login)
-            const hasFrameset = document.getElementsByTagName('frameset').length > 0;
-            if (hasFrameset || title.includes("ethicspoint administration")) {
-                return "MFA_OR_LANDING";
-            }
-
-            // Microsoft SSO page
-            if (title.includes("sign in")) {
-                return "MFA_REQUIRED";
-            }
-
-            return "UNKNOWN";
         })();
         """
 
@@ -202,26 +212,78 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         url_now = self.browser.url().toString()
         print(f"[SNIFF:{seq}] start reason={reason} url={url_now} t={time.time():.3f}")
 
+        external_dc_js = """
+        (function() {
+            try {
+                const text = (document.body && document.body.innerText ? document.body.innerText : "").toLowerCase();
+
+                // Strongest signal: explicit banner text
+                const hasExternalBanner = text.includes("this client record is referencing an external data center");
+
+                // Safer fallback: external_clientid with a real value AND non-default datacenter selected
+                const ext = document.querySelector('input[name="external_clientid"]');
+                const extVal = ext && ext.value ? ext.value.trim() : "";
+                const dcSel = document.querySelector('select[name="CMDataCenterID"]');
+                const dcVal = dcSel && dcSel.value ? dcSel.value : "";
+
+                const hasExternalIdMeaningful = (extVal.length > 0 && dcVal !== "" && dcVal !== "1");
+
+                return !!(hasExternalBanner || hasExternalIdMeaningful);
+            } catch (e) {
+                return false;
+            }
+        })();
+        """
+
+        def _external_cb(is_external):
+            current = self.browser.url().toString().lower()
+            print(f"[SNIFF:{seq}] external_dc={repr(is_external)} url_now={current}")
+
+            # IMPORTANT: only flip from .com -> .eu based on this "external DC" trigger
+            if is_external is True and "ethicspoint.com" in current:
+                self.handle_region_flip("TRY_OTHER_SERVER")
+
+        self.browser.page().runJavaScript(external_dc_js, _external_cb)
+
+        # --- ultra-simple JS sanity checks (should NOT be empty) ---
+        self.browser.page().runJavaScript(
+            "1+1",
+            lambda v: print(f"[SNIFF:{seq}] js(1+1)={repr(v)} url_now={self.browser.url().toString()}")
+        )
+        self.browser.page().runJavaScript(
+            "document.title",
+            lambda v: print(f"[SNIFF:{seq}] js(title)={repr(v)} url_now={self.browser.url().toString()}")
+        )
+
+        # --- diag as JSON string (more reliable than returning an object) ---
         diag_js = """
         (function() {
             try {
-                return {
+                return JSON.stringify({
                     title: document.title || "",
                     readyState: document.readyState || "",
                     hasBody: !!document.body,
                     bodyLen: (document.body && document.body.innerText) ? document.body.innerText.length : 0,
                     hasExternalClientId: (document.getElementsByName && document.getElementsByName('external_clientid') && document.getElementsByName('external_clientid').length > 0)
-                };
+                });
             } catch (e) {
-                return { error: String(e) };
+                return "JS_ERROR:" + String(e);
             }
         })();
         """
-        self.browser.page().runJavaScript(
-            diag_js,
-            lambda diag: print(f"[SNIFF:{seq}] diag={diag} url_now={self.browser.url().toString()}")
-        )
+        def _diag_cb(diag_str):
+            print(f"[SNIFF:{seq}] diag_raw={repr(diag_str)} url_now={self.browser.url().toString()}")
+            if isinstance(diag_str, str) and diag_str.startswith("{"):
+                try:
+                    diag_obj = json.loads(diag_str)
+                except Exception as e:
+                    print(f"[SNIFF:{seq}] diag_json_parse_error={repr(e)}")
+                    return
+                print(f"[SNIFF:{seq}] diag={diag_obj}")
 
+        self.browser.page().runJavaScript(diag_js, _diag_cb)
+
+        # Run the real sniffer
         self.browser.page().runJavaScript(
             self._sniffer_js,
             lambda result: self.handle_sniffer_result(result, seq, reason)
@@ -236,6 +298,10 @@ class MyWindow(QMainWindow, Ui_MainWindow):
 
     def handle_sniffer_result(self, result, seq=None, reason=None):
         print(f"[SNIFF:{seq}] result={repr(result)} reason={reason} url_now={self.browser.url().toString()}")
+
+        if isinstance(result, dict) and result.get("status") == "JS_ERROR":
+            self.statusBar().showMessage(f"Sniffer JS error: {result.get('message')}")
+            return
 
         if result in ("", "UNKNOWN", None):
             if hasattr(self, "watchdog") and self.watchdog.isActive():
