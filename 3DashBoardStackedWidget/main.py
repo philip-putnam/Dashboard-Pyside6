@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (QMainWindow, QApplication, QLineEdit,
                                QTabWidget, QVBoxLayout, QLabel, QWidget,
                                QFileDialog, QMenu, QHeaderView, QStackedWidget,
                                QSizePolicy, QHBoxLayout)
-from PySide6.QtCore import (QStandardPaths, Qt, QFileInfo, QUrl, QRegularExpression,
-                            QThreadPool, QDir, QTimer)
+from PySide6.QtCore import (Qt, QFileInfo, QUrl, QRegularExpression,
+                            QThreadPool, QDir, QTimer, QStandardPaths)
 from PySide6.QtGui import (QAction, QDesktopServices, QRegularExpressionValidator,
                            QShortcut, QKeySequence)
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -39,6 +39,13 @@ class MyWindow(QMainWindow, Ui_MainWindow):
     def __init__(self):
         super().__init__()
         self.setupUi(self)
+
+        # --- logging controls ---
+        self.debug_level = 1  # 0=quiet, 1=important, 2=verbose
+        log_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        os.makedirs(log_dir, exist_ok=True)
+        self._log_path = os.path.join(log_dir, "sniffer.log")
+        self._log_max_lines = 2000
 
         # Sniffer counters used by run_sniffer()/watchdog
         self._sniff_seq = 0
@@ -116,6 +123,27 @@ class MyWindow(QMainWindow, Ui_MainWindow):
 
         # NOTE: DO NOT call setup_browser_logic() a second time here.
         self.browser.setUrl(QUrl("https://secure.ethicspoint.com/domain/administration/client_admin.asp"))
+
+    def log(self, msg: str, level: int = 1):
+        """Levelled logger that also writes to a file for easy sharing."""
+        if level <= getattr(self, "debug_level", 1):
+            print(msg)
+
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            return
+
+        # crude log trimming (keeps file from growing forever)
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > self._log_max_lines:
+                with open(self._log_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-self._log_max_lines :])
+        except Exception:
+            return
 
     def setup_browser_logic(self):
         # 1. Network Speed Hack
@@ -245,15 +273,11 @@ class MyWindow(QMainWindow, Ui_MainWindow):
 
         self.browser.page().runJavaScript(external_dc_js, _external_cb)
 
-        # --- ultra-simple JS sanity checks (should NOT be empty) ---
-        self.browser.page().runJavaScript(
-            "1+1",
-            lambda v: print(f"[SNIFF:{seq}] js(1+1)={repr(v)} url_now={self.browser.url().toString()}")
-        )
-        self.browser.page().runJavaScript(
-            "document.title",
-            lambda v: print(f"[SNIFF:{seq}] js(title)={repr(v)} url_now={self.browser.url().toString()}")
-        )
+        # OPTIONAL: comment out js(title) once you're confident
+        # self.browser.page().runJavaScript(
+        #     "document.title",
+        #     lambda v: print(f"[SNIFF:{seq}] js(title)={repr(v)} url_now={self.browser.url().toString()}")
+        # )
 
         # --- diag as JSON string (more reliable than returning an object) ---
         diag_js = """
@@ -279,7 +303,12 @@ class MyWindow(QMainWindow, Ui_MainWindow):
                 except Exception as e:
                     print(f"[SNIFF:{seq}] diag_json_parse_error={repr(e)}")
                     return
-                print(f"[SNIFF:{seq}] diag={diag_obj}")
+
+                # Save latest diag for handle_sniffer_result() to use
+                self._last_diag = diag_obj
+
+                # Keep one concise diag line (optional)
+                print(f"[SNIFF:{seq}] diag_title={diag_obj.get('title')} ready={diag_obj.get('readyState')} bodyLen={diag_obj.get('bodyLen')}")
 
         self.browser.page().runJavaScript(diag_js, _diag_cb)
 
@@ -303,7 +332,22 @@ class MyWindow(QMainWindow, Ui_MainWindow):
             self.statusBar().showMessage(f"Sniffer JS error: {result.get('message')}")
             return
 
+        # --- NEW: if sniffer is empty/unknown, use last diag to decide whether to stop retrying ---
         if result in ("", "UNKNOWN", None):
+            diag = getattr(self, "_last_diag", None)
+            if isinstance(diag, dict):
+                title = (diag.get("title") or "")
+                ready = (diag.get("readyState") or "")
+                body_len = int(diag.get("bodyLen") or 0)
+
+                looks_like_client = title.startswith("EP - Viewing Client #") and ready == "complete" and body_len > 0
+                if looks_like_client:
+                    # Stop retry loop and show a sane status
+                    self._sniff_retries = 0
+                    self.statusBar().showMessage("Ready. Enter Client ID.")
+                    return
+
+            # Existing retry behavior
             if hasattr(self, "watchdog") and self.watchdog.isActive():
                 if self._sniff_retries < self._max_sniff_retries:
                     self._sniff_retries += 1
@@ -347,19 +391,21 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         if result == "TRY_OTHER_SERVER":
             current_url = self.browser.url().toString()
 
-            if not getattr(self, "_already_flipped", False):
+            if not getattr(self, '_already_flipped', False):
                 self._already_flipped = True
 
                 old_domain = ".com" if ".com" in current_url else ".eu"
                 new_domain = ".eu" if ".com" in current_url else ".com"
                 new_url = current_url.replace(old_domain, new_domain)
 
-                self.statusBar().showMessage(f"Redirecting to {new_domain.strip('.')}")
+                # Remember which domain we intended for THIS search/session
+                self._preferred_domain = "ethicspoint.eu" if new_domain == ".eu" else "ethicspoint.com"
 
+                self.statusBar().showMessage(f" Redirecting to {new_domain.strip('.')}")
                 self.web_profile.cookieStore().loadAllCookies()
                 self.browser.setUrl(QUrl(new_url))
             else:
-                self.statusBar().showMessage("Not found on either server.")
+                self.statusBar().showMessage("❌ Not found on either server.")
 
     def handle_url_change(self, qurl):
         url_str = qurl.toString().lower()
@@ -368,7 +414,12 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         if "administration" in url_str and "client_admin" not in url_str:
             if hasattr(self, 'last_requested_cid'):
                 cid = self.last_requested_cid
-                domain = "ethicspoint.eu" if 100000 <= cid <= 1000000 else "ethicspoint.com"
+
+                # If we already decided a preferred domain (e.g., due to external DC flip), honor it.
+                domain = getattr(self, "_preferred_domain", None)
+                if not domain:
+                    domain = "ethicspoint.eu" if 100000 <= cid <= 1000000 else "ethicspoint.com"
+
                 new_target = f"https://secure.{domain}/domain/administration/client_admin.asp?clientid={cid}"
 
                 self.statusBar().showMessage("Login successful! Redirecting to CID...")
@@ -693,9 +744,14 @@ class MyWindow(QMainWindow, Ui_MainWindow):
     def handle_submit(self):
         raw_text = self.header_input.text().lower().strip()
         cid_digits = "".join(filter(str.isdigit, raw_text))
-        if not cid_digits: return
+        if not cid_digits:
+            return
 
         self.last_requested_cid = int(cid_digits)
+
+        # Reset per search
+        self._preferred_domain = None
+        self._already_flipped = False
 
         # --- CRITICAL: Reset the guard only here ---
         self._already_flipped = False
