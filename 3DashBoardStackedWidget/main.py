@@ -3,6 +3,7 @@
 
 import sys
 import os
+import time
 
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--log-level=3 --disable-logging"
 
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import (QMainWindow, QApplication, QLineEdit,
                                QFileDialog, QMenu, QHeaderView, QStackedWidget,
                                QSizePolicy, QHBoxLayout)
 from PySide6.QtCore import (QStandardPaths, Qt, QFileInfo, QUrl, QRegularExpression,
-                            QThreadPool, QDir)
+                            QThreadPool, QDir, QTimer)
 from PySide6.QtGui import (QAction, QDesktopServices, QRegularExpressionValidator,
                            QShortcut, QKeySequence)
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -59,7 +60,51 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         # 5. Setup Header (Called last)
         self.setup_header_widgets()
 
-        self.setup_browser_logic()
+        # Keep the sniffer JS accessible for retries
+        self._sniffer_js = """
+        (function() {
+            const text = (document.body && document.body.innerText ? document.body.innerText : "").toLowerCase();
+            const title = (document.title || "").toLowerCase();
+            const html = (document.documentElement && document.documentElement.innerHTML ? document.documentElement.innerHTML : "").toLowerCase();
+
+            const cidInput = document.querySelector('input[name="ClientID"]');
+            const nameInput = document.querySelector('input[name="name"]');
+
+            // SUCCESS: standard client page
+            if (cidInput && cidInput.value !== "0" && nameInput && nameInput.value.trim().length > 0) {
+                return { status: "SUCCESS", name: nameInput.value, client_id: cidInput.value };
+            }
+
+            // External data center / not found messages (prefer visible text)
+            const isExternal =
+                text.includes("referencing an external data center") ||
+                html.includes("external data center") ||
+                document.getElementsByName('external_clientid').length > 0;
+
+            const isNotFound =
+                text.includes("could not find client") ||
+                html.includes("could not find client") ||
+                (cidInput && cidInput.value === "0");
+
+            if (isExternal) return "TRY_OTHER_SERVER";
+            if (isNotFound) return "TRY_OTHER_SERVER";
+
+            // Landing/frameset admin shell (common right after login)
+            const hasFrameset = document.getElementsByTagName('frameset').length > 0;
+            if (hasFrameset || title.includes("ethicspoint administration")) {
+                return "MFA_OR_LANDING";
+            }
+
+            // Microsoft SSO page
+            if (title.includes("sign in")) {
+                return "MFA_REQUIRED";
+            }
+
+            return "UNKNOWN";
+        })();
+        """
+
+        # NOTE: DO NOT call setup_browser_logic() a second time here.
         self.browser.setUrl(QUrl("https://secure.ethicspoint.com/domain/administration/client_admin.asp"))
 
     def setup_browser_logic(self):
@@ -75,15 +120,18 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         self.web_profile.setPersistentStoragePath(storage_path)
         self.web_profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
 
-        self.web_profile = QWebEngineProfile("MyProfile", self)
+        # Enable DevTools reliably (PySide6 enum name differs across builds)
+        try:
+            devtools_attr = QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled
+        except AttributeError:
+            devtools_attr = QWebEngineSettings.WebAttribute(13)
 
-        # --- THE FIX: Use the integer index for DeveloperExtrasEnabled ---
-        # 13 is the universal Qt index for enabling Inspect Element
-        self.web_profile.settings().setAttribute(QWebEngineSettings.WebAttribute(13), True)
+        self.web_profile.settings().setAttribute(devtools_attr, True)
 
         # 3. Create Browser & Page
         self.browser = QWebEngineView()
         self.web_page = QWebEnginePage(self.web_profile, self.browser)
+        self.web_page.settings().setAttribute(devtools_attr, True)
         self.browser.setPage(self.web_page)
 
         # 4. CLEAN Page 4 Layout
@@ -103,10 +151,149 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         # 6. Signals
         self.browser.loadStarted.connect(lambda: self.statusBar().showMessage("Loading EthicsPoint..."))
 
+        self.browser.loadFinished.connect(
+            lambda ok: self.statusBar().showMessage("Ready" if ok else "Load Failed", 3000)
+        )
+
+        # Connect the Sniffer logic
+        self.browser.loadFinished.connect(self.on_page_load_finished)
         self.browser.urlChanged.connect(self.handle_url_change)
 
-        # Using a named function prevents duplicate logic issues
-        self.browser.loadFinished.connect(self.on_page_load_finished)
+        self.browser.loadFinished.connect(lambda: self.statusBar().clearMessage())
+
+        # DevTools shortcut (Ctrl+Shift+I)
+        self._devtools_shortcut = QShortcut(QKeySequence("Ctrl+Shift+I"), self)
+        self._devtools_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._devtools_shortcut.activated.connect(self.open_devtools)
+
+    def open_devtools(self):
+        """Open Chromium DevTools attached to the embedded QWebEnginePage."""
+        if not hasattr(self, "web_page") or self.web_page is None:
+            print("[DEVTOOLS] web_page is not ready yet.")
+            return
+
+        if getattr(self, "_devtools_window", None) is None:
+            self._devtools_window = QMainWindow(self)
+            self._devtools_window.setWindowTitle("DevTools")
+            self._devtools_view = QWebEngineView(self._devtools_window)
+            self._devtools_window.setCentralWidget(self._devtools_view)
+            self._devtools_window.resize(1100, 800)
+
+            # Attach DevTools to the same page used by the main browser
+            self.web_page.setDevToolsPage(self._devtools_view.page())
+
+        self._devtools_window.show()
+        self._devtools_window.raise_()
+        self._devtools_window.activateWindow()
+
+    def on_page_load_finished(self, ok):
+        if not ok:
+            return
+
+        # Give dynamic content a moment to settle
+        QTimer.singleShot(
+            300,
+            lambda: self.browser.page().runJavaScript(self._sniffer_js, self.handle_sniffer_result)
+        )
+
+    def run_sniffer(self, reason: str):
+        self._sniff_seq += 1
+        seq = self._sniff_seq
+        url_now = self.browser.url().toString()
+        print(f"[SNIFF:{seq}] start reason={reason} url={url_now} t={time.time():.3f}")
+
+        diag_js = """
+        (function() {
+            try {
+                return {
+                    title: document.title || "",
+                    readyState: document.readyState || "",
+                    hasBody: !!document.body,
+                    bodyLen: (document.body && document.body.innerText) ? document.body.innerText.length : 0,
+                    hasExternalClientId: (document.getElementsByName && document.getElementsByName('external_clientid') && document.getElementsByName('external_clientid').length > 0)
+                };
+            } catch (e) {
+                return { error: String(e) };
+            }
+        })();
+        """
+        self.browser.page().runJavaScript(
+            diag_js,
+            lambda diag: print(f"[SNIFF:{seq}] diag={diag} url_now={self.browser.url().toString()}")
+        )
+
+        self.browser.page().runJavaScript(
+            self._sniffer_js,
+            lambda result: self.handle_sniffer_result(result, seq, reason)
+        )
+
+    def force_sniffer_check(self):
+        """Forces the sniffer to run if the page is stuck on white/loading."""
+        if self.stackedWidget.currentIndex() == 1:
+            self.statusBar().showMessage("Checking page state...")
+            print(f"[WATCHDOG] fired url={self.browser.url().toString()} t={time.time():.3f}")
+            self.run_sniffer("watchdog")
+
+    def handle_sniffer_result(self, result, seq=None, reason=None):
+        print(f"[SNIFF:{seq}] result={repr(result)} reason={reason} url_now={self.browser.url().toString()}")
+
+        if result in ("", "UNKNOWN", None):
+            if hasattr(self, "watchdog") and self.watchdog.isActive():
+                if self._sniff_retries < self._max_sniff_retries:
+                    self._sniff_retries += 1
+                    QTimer.singleShot(500, lambda: self.run_sniffer(f"retry({self._sniff_retries})"))
+                else:
+                    print(f"[SNIFF:{seq}] giving up after {self._sniff_retries} retries")
+                    self.statusBar().showMessage("Sniffer gave no result (max retries).")
+            return
+
+        self._sniff_retries = 0
+
+        if result == "MFA_OR_LANDING":
+            if hasattr(self, "last_requested_cid"):
+                cid = self.last_requested_cid
+                self.statusBar().showMessage(f"Login detected. Navigating to CID {cid}...")
+                del self.last_requested_cid
+                self.handle_submit()
+            else:
+                self.statusBar().showMessage("Ready. Enter Client ID.")
+            return
+
+        if result == "MFA_REQUIRED":
+            self.statusBar().showMessage("MFA/Login Required - Please log in to continue.")
+            return
+
+        if result == "TRY_OTHER_SERVER":
+            self.handle_region_flip("TRY_OTHER_SERVER")
+            return
+
+        if isinstance(result, dict) and result.get("status") == "SUCCESS":
+            client_name = result.get("name") or "Unknown"
+            self.setWindowTitle(f"EthicsPoint Manager - {client_name}")
+            self.statusBar().showMessage(f"Active Client: {client_name}")
+            if hasattr(self, "client_name_display"):
+                self.client_name_display.setText(client_name)
+            return
+
+    def handle_region_flip(self, result):
+        print(f"DEBUG: Sniffer Result = {result}")
+
+        if result == "TRY_OTHER_SERVER":
+            current_url = self.browser.url().toString()
+
+            if not getattr(self, "_already_flipped", False):
+                self._already_flipped = True
+
+                old_domain = ".com" if ".com" in current_url else ".eu"
+                new_domain = ".eu" if ".com" in current_url else ".com"
+                new_url = current_url.replace(old_domain, new_domain)
+
+                self.statusBar().showMessage(f"Redirecting to {new_domain.strip('.')}")
+
+                self.web_profile.cookieStore().loadAllCookies()
+                self.browser.setUrl(QUrl(new_url))
+            else:
+                self.statusBar().showMessage("Not found on either server.")
 
     def handle_url_change(self, qurl):
         url_str = qurl.toString().lower()
@@ -120,75 +307,6 @@ class MyWindow(QMainWindow, Ui_MainWindow):
 
                 self.statusBar().showMessage("Login successful! Redirecting to CID...")
                 self.browser.setUrl(QUrl(new_target))
-
-    def on_page_load_finished(self, ok):
-        if not ok: return
-
-        # This script checks for your specific HTML markers: "ClientID=0" or "Not Found" text
-        js_check = """
-        (function() {
-            let html = document.body.innerText;
-            let cidInput = document.querySelector('input[name="ClientID"]');
-            let external = html.includes("external data center") || document.getElementsByName('external_clientid').length > 0;
-
-            if (html.includes("Could not find client in the CM Database") || (cidInput && cidInput.value === "0") || external) {
-                return "TRY_OTHER_SERVER";
-            }
-            if (cidInput && cidInput.value !== "0") {
-                return { "status": "SUCCESS", "name": document.querySelector('input[name="name"]')?.value || "Found" };
-            }
-            return "UNKNOWN";
-        })()
-        """
-        self.browser.page().runJavaScript(js_check, self.handle_region_flip)
-
-    def handle_region_flip(self, result):
-        if result == "TRY_OTHER_SERVER":
-            current_url = self.browser.url().toString()
-            # If we haven't already retried for THIS search
-            if not hasattr(self, '_is_retrying') or not self._is_retrying:
-                self._is_retrying = True
-                new_url = current_url.replace(".com", ".eu") if ".com" in current_url else current_url.replace(".eu",
-                                                                                                               ".com")
-                self.statusBar().showMessage("🔄 Not found. Swapping regions...")
-                self.browser.setUrl(QUrl(new_url))
-            else:
-                self.statusBar().showMessage("❌ Client not found on either server.")
-                self._is_retrying = False
-        elif isinstance(result, dict) and result.get("status") == "SUCCESS":
-            self._is_retrying = False
-            self.client_name_display.setText(f"Active: {result['name']}")
-
-    def handle_sniffer_result(self, result):
-        if not result: return
-        status = result.get("status")
-
-        if status in ["NOT_FOUND", "EXTERNAL_REFERRAL"]:
-            current_url = self.browser.url().toString()
-
-            # Simple toggle: If on .com go to .eu, if on .eu go to .com
-            if ".com" in current_url:
-                new_url = current_url.replace(".com", ".eu")
-            elif ".eu" in current_url:
-                new_url = current_url.replace(".eu", ".com")
-            else:
-                return
-
-            # Prevent endless bouncing: We only swap once per "Execute" click
-            if not hasattr(self, '_is_retrying') or not self._is_retrying:
-                self._is_retrying = True
-                self.statusBar().showMessage(f"Switching Region... (Found {status})")
-                self.browser.setUrl(QUrl(new_url))
-            else:
-                self.statusBar().showMessage("❌ Client not found on either server.")
-                self._is_retrying = False
-
-        elif status == "SUCCESS":
-
-            client_name = result.get("name")
-            # Update the Header Label!
-            self.client_name_display.setText(f"Active: {client_name}")
-            self.statusBar().showMessage(f"✅ Loaded: {client_name}")
 
     def process_page_state(self, result):
         if not result: return
@@ -458,7 +576,6 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         # 2. Buttons
         self.header_button = QPushButton("Execute")
 
-        # --- THE FIX: Define self.view_btn clearly ---
         self.view_btn = QPushButton("Show Browser")
         self.view_btn.setCheckable(True)
 
@@ -480,6 +597,21 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         self.header.addWidget(self.view_btn)
         self.header.addWidget(self.back_to_files_btn)
 
+        # 1. Re-create the Refresh Button
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.header.addWidget(self.refresh_btn)
+
+        # 2. Logic to Show/Hide based on the view
+        # Ensure it shows if we are already on the browser (Index 1)
+        self.refresh_btn.setVisible(self.stackedWidget.currentIndex() == 1)
+
+        # Connect to the stack's change signal
+        self.stackedWidget.currentChanged.connect(
+            lambda idx: self.refresh_btn.setVisible(idx == 1)
+        )
+
+        self.refresh_btn.clicked.connect(self.browser.reload)
+
         # 5. Connections
         self.header_button.clicked.connect(self.handle_submit)
         self.header_input.returnPressed.connect(self.handle_submit)
@@ -497,20 +629,28 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         cid_digits = "".join(filter(str.isdigit, raw_text))
         if not cid_digits: return
 
-        # Store for the MFA auto-jump!
         self.last_requested_cid = int(cid_digits)
-        self._is_retrying = False
 
+        # --- CRITICAL: Reset the guard only here ---
+        self._already_flipped = False
+
+        # CORRECTED URL PARAMETER: clientid=
         domain = "ethicspoint.eu" if 100000 <= self.last_requested_cid <= 1000000 else "ethicspoint.com"
         target_url = f"https://secure.{domain}/domain/administration/client_admin.asp?clientid={self.last_requested_cid}"
 
-        self.browser.setUrl(QUrl(target_url))
         self.stackedWidget.setCurrentIndex(1)
-
-        # Sync the toggle button
         if hasattr(self, 'view_btn'):
             self.view_btn.setChecked(True)
             self.view_btn.setText("Show Explorer")
+
+        self.browser.setUrl(QUrl(target_url))
+
+        # Start Watchdog (extended to 10s to allow for slow SSO)
+        if hasattr(self, 'watchdog'): self.watchdog.stop()
+        self.watchdog = QTimer(self)
+        self.watchdog.setSingleShot(True)
+        self.watchdog.timeout.connect(self.force_sniffer_check)
+        self.watchdog.start(10000)
 
     def on_server_ready(self, url):
         # Default: Show it inside the app
