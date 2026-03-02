@@ -124,6 +124,69 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         # NOTE: DO NOT call setup_browser_logic() a second time here.
         self.browser.setUrl(QUrl("https://secure.ethicspoint.com/domain/administration/client_admin.asp"))
 
+    def update_client_name_from_page(self):
+        js_name = """
+        (function() {
+            try {
+                const text = (document.body && document.body.innerText ? document.body.innerText : "").toLowerCase();
+
+                const nameEl = document.querySelector('input[name="name"]');
+                const nameVal = nameEl && nameEl.value ? nameEl.value.trim() : "";
+
+                const hasExternalBanner = text.includes("this client record is referencing an external data center");
+                const extIdEl = document.querySelector('input[name="external_clientid"]');
+                const extIdVal = extIdEl && extIdEl.value ? extIdEl.value.trim() : "";
+
+                const isNotFound = text.includes("could not find client in the cm database")
+                               || text.includes("could not find client");
+
+                // "External tier" means: page indicates external data center and has an external id value
+                const isExternalTier = (hasExternalBanner && extIdVal.length > 0);
+
+                return {
+                    name: nameVal.length ? nameVal : null,
+                    isExternalTier: !!isExternalTier,
+                    notFound: !!isNotFound
+                };
+            } catch (e) {
+                return { name: null, isExternalTier: false, notFound: false };
+            }
+        })();
+        """
+
+        def _cb(payload):
+            if not isinstance(payload, dict):
+                return
+
+            current_url = self.browser.url().toString().lower()
+            preferred = (getattr(self, "_preferred_domain", None) or "").lower()
+
+            # If we have a preferred domain (because we flipped), don't show "wrong tier" names
+            if preferred and preferred not in current_url:
+                return
+
+            # Never show name on "not found" pages
+            if payload.get("notFound") is True:
+                return
+
+            # Never show US-tier name if it's an external-DC redirect tier
+            if payload.get("isExternalTier") is True and "ethicspoint.com" in current_url:
+                return
+
+            name = payload.get("name")
+            if not (isinstance(name, str) and name.strip()):
+                return
+
+            clean_name = name.strip()
+
+            if hasattr(self, "client_name_display"):
+                self.client_name_display.setText(clean_name)
+                self.client_name_display.setStyleSheet("font-weight: bold; color: red; padding: 0 10px;")
+
+            self.setWindowTitle(f"EthicsPoint Manager - {clean_name}")
+
+        self.browser.page().runJavaScript(js_name, _cb)
+
     def log(self, msg: str, level: int = 1):
         """Levelled logger that also writes to a file for easy sharing."""
         if level <= getattr(self, "debug_level", 1):
@@ -269,6 +332,8 @@ class MyWindow(QMainWindow, Ui_MainWindow):
 
             # IMPORTANT: only flip from .com -> .eu based on this "external DC" trigger
             if is_external is True and "ethicspoint.com" in current:
+                # Set preferred domain BEFORE navigation so we don't display the US-tier name
+                self._preferred_domain = "ethicspoint.eu"
                 self.handle_region_flip("TRY_OTHER_SERVER")
 
         self.browser.page().runJavaScript(external_dc_js, _external_cb)
@@ -283,18 +348,24 @@ class MyWindow(QMainWindow, Ui_MainWindow):
         diag_js = """
         (function() {
             try {
+                const text = (document.body && document.body.innerText ? document.body.innerText : "").toLowerCase();
+                const notFound = text.includes("could not find client in the cm database")
+                              || text.includes("could not find client");
+
                 return JSON.stringify({
                     title: document.title || "",
                     readyState: document.readyState || "",
                     hasBody: !!document.body,
                     bodyLen: (document.body && document.body.innerText) ? document.body.innerText.length : 0,
-                    hasExternalClientId: (document.getElementsByName && document.getElementsByName('external_clientid') && document.getElementsByName('external_clientid').length > 0)
+                    hasExternalClientId: (document.getElementsByName && document.getElementsByName('external_clientid') && document.getElementsByName('external_clientid').length > 0),
+                    notFound: notFound
                 });
             } catch (e) {
                 return "JS_ERROR:" + String(e);
             }
         })();
         """
+
         def _diag_cb(diag_str):
             print(f"[SNIFF:{seq}] diag_raw={repr(diag_str)} url_now={self.browser.url().toString()}")
             if isinstance(diag_str, str) and diag_str.startswith("{"):
@@ -308,7 +379,34 @@ class MyWindow(QMainWindow, Ui_MainWindow):
                 self._last_diag = diag_obj
 
                 # Keep one concise diag line (optional)
-                print(f"[SNIFF:{seq}] diag_title={diag_obj.get('title')} ready={diag_obj.get('readyState')} bodyLen={diag_obj.get('bodyLen')}")
+                print(
+                    f"[SNIFF:{seq}] diag_title={diag_obj.get('title')} "
+                    f"ready={diag_obj.get('readyState')} bodyLen={diag_obj.get('bodyLen')}"
+                )
+
+                # If we're clearly on a loaded client page, pull Company Name into the header label
+                title = (diag_obj.get("title") or "")
+                ready = (diag_obj.get("readyState") or "")
+                body_len = int(diag_obj.get("bodyLen") or 0)
+                has_external_id = bool(diag_obj.get("hasExternalClientId"))
+
+                if title.startswith("EP - Viewing Client #") and ready == "complete" and body_len > 0:
+                    current = self.browser.url().toString().lower()
+                    preferred = (getattr(self, "_preferred_domain", None) or "").lower()
+                    not_found = bool(diag_obj.get("notFound"))
+
+                    # If we're on the intended/final domain and it's not found, clear header
+                    if preferred and preferred in current and not_found:
+                        if hasattr(self, "client_name_display"):
+                            self.client_name_display.setText("No Client Active")
+                            self.client_name_display.setStyleSheet("font-weight: bold; color: blue; padding: 0 10px;")
+                        return
+
+                    # If this is the US tier with external client id, don't show name yet
+                    if has_external_id and "ethicspoint.com" in current:
+                        return
+
+                    self.update_client_name_from_page()
 
         self.browser.page().runJavaScript(diag_js, _diag_cb)
 
@@ -749,11 +847,13 @@ class MyWindow(QMainWindow, Ui_MainWindow):
 
         self.last_requested_cid = int(cid_digits)
 
+        # Clear UI immediately for the new search
+        if hasattr(self, "client_name_display"):
+            self.client_name_display.setText("No Client Active")
+            self.client_name_display.setStyleSheet("font-weight: bold; color: blue; padding: 0 10px;")
+
         # Reset per search
         self._preferred_domain = None
-        self._already_flipped = False
-
-        # --- CRITICAL: Reset the guard only here ---
         self._already_flipped = False
 
         # CORRECTED URL PARAMETER: clientid=
